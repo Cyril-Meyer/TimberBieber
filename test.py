@@ -1,188 +1,225 @@
 import json
 import timeit
 
+import numpy as np
 import pandas as pd
-import rectpack
 import rectpack.guillotine as guillotine
+import rectpack.maxrects as maxrects
 import rectpack.skyline as skyline
-from rectpack import PackingMode, newPacker
+from rectpack import PackingBin, PackingMode, newPacker
 
-# ---------------------------------------------------------
-# Step 1: Convert XLSX to CSV
-# ---------------------------------------------------------
-excel_file = "Automne de l'IA 2026 SG DDM - Données articles et matières.xlsx"
-csv_file = "Données_articles_et_matières.csv"
-
-# Choose your target sheet: use the exact sheet name (string) or index (integer, e.g., 1 for the second sheet)
-target_sheet = "Articles"
-
-# Load Excel and export to CSV
-df_excel = pd.read_excel(excel_file, sheet_name=target_sheet, engine="openpyxl")
-df_excel.to_csv(csv_file, index=False)
-print(f"Successfully converted {excel_file} to {csv_file}")
-
-# ---------------------------------------------------------
-# Step 2: Extract desired columns from the converted CSV
-# ---------------------------------------------------------
-df = pd.read_csv(csv_file)
-# Focus on a specific coloris (e.g., 215371, 220965) for this example. Adjust as needed.
-filtered_df = df[df["Coloris"] == 215371]
-
-# Expected CSV columns : 'Article', 'Désignation article', 'X', 'Y', 'quantity'
-components = []
-for _, row in filtered_df.iterrows():
-    article_id = str(row["Article"])
-    Designation_article = str(row["Désignation article"])
-    article_x = int(row["X"])  # type: ignore
-    article_y = int(row["Y"])  # type: ignore
-    quantity = int(row["QtéParSemaine"])  # type: ignore
-
-    # Expand quantities into individual component items
-    for q in range(quantity):
-        components.append((f"{Designation_article}_{q}", article_x, article_y))
-
-print(f"Extracted {len(components)} total individual panels to cut in a week.")
-
-# ---------------------------------------------------------
-# Step 3: Run rectpack Optimization
-# ---------------------------------------------------------
-# Standard wood panel dimensions (e.g., 2440mm x 1220mm)
-panel_x = 26550
-panel_y = 21000
-
-# Check for oversized components before packing
-oversized = [
-    comp
-    for comp in components
-    if (comp[1] > panel_x or comp[2] > panel_y)
-    and (comp[1] > panel_x or comp[2] > panel_y)
+excel_files = [
+    "Automne de l'IA 2026 SG DDM - Données articles et matières.xlsx",
+    "Automne de l'IA 2026 SG DDM - OFs et TdC.xlsx",
 ]
+csv_list = ["Données_articles.csv", "Données_matières.csv", "Données_OF.csv"]
 
-if oversized:
-    print(
-        f"⚠️ Found {len(oversized)} components larger than the sheet size ({panel_x}x{panel_y}):"
+
+def load_base_data():
+    """Loads raw Excel files into CSV and returns base dataframes and panel dimensions."""
+    pd.read_excel(excel_files[0], sheet_name="Articles").to_csv(csv_list[0], index=False)
+    pd.read_excel(excel_files[0], sheet_name="Matière").to_csv(csv_list[1], index=False)
+    pd.read_excel(excel_files[1], sheet_name="OF").to_csv(csv_list[2], index=False)
+
+    df_matiere = pd.read_csv(csv_list[1])
+    panel_x = int(df_matiere[df_matiere["Matiere"] == 215371]["X"].values[0])  # type: ignore
+    panel_y = int(df_matiere[df_matiere["Matiere"] == 215371]["Y"].values[0])  # type: ignore
+
+    df_OF = pd.read_csv(csv_list[2])
+    df_article = pd.read_csv(csv_list[0])
+
+    return panel_x, panel_y, df_OF, df_article
+
+
+def get_weekly_components(df_OF, df_article):
+    """Filters OF data and groups components by ISO calendar weeks (S17 to S42)."""
+    df_OF["DateProd"] = pd.to_datetime(df_OF["DateProd"], errors="coerce")
+
+    # Extract ISO Year and Week
+    iso_cal = df_OF["DateProd"].dt.isocalendar()
+    df_OF["ISO_Year"] = iso_cal["year"]
+    df_OF["ISO_Week"] = iso_cal["week"]
+
+    # Filter for weeks 17 to 42 in the year 2026
+    df_filtered_of = df_OF[
+        (df_OF["ISO_Year"] == 2026) & 
+        (df_OF["ISO_Week"] >= 17) & 
+        (df_OF["ISO_Week"] <= 42)
+    ].copy()
+
+    weekly_data = {}
+
+    # Group by ISO week
+    for (year, week), group in df_filtered_of.groupby(["ISO_Year", "ISO_Week"]):
+        week_label = f"{year}/S{week:02d}" # e.g., "2026/S17"
+
+        # Aggregate demand per article for this ISO week
+        df_aggregated = group.groupby("Article", as_index=False)["Qté cdée"].sum()
+
+        # Merge with article specs for coloris 215371
+        df_merged = df_aggregated.merge(
+            df_article[df_article["Coloris"] == 215371], on="Article"
+        )
+
+        if df_merged.empty:
+            continue
+
+        # Apply batch rounding (QtéParOF rules)
+        multiple = df_merged["QtéParOF"].fillna(1).clip(lower=1)
+        df_merged["Qte_final"] = (
+            np.ceil(df_merged["Qté cdée"] / multiple) * multiple
+        ).astype(int)
+
+        # Expand into individual components list for this week
+        components = []
+        for _, row in df_merged.iterrows():
+            designation = str(row["Désignation article"])
+            x = int(row["X"])  # type: ignore
+            y = int(row["Y"])  # type: ignore
+            qty = int(row["Qte_final"])  # type: ignore
+
+            for q in range(qty):
+                components.append((f"{designation}_{q}", x, y))
+
+        weekly_data[week_label] = {
+            "total_command": int(group["Qté cdée"].sum()),
+            "components": components,
+        }
+
+    return weekly_data
+
+
+def run_optimization_for_week(semaine_str, components, algo_type, algo, panel_x, panel_y):
+    """Executes packing optimization for a specific week and algorithm, then saves to JSON."""
+    print(f"[{semaine_str}] Running {algo_type} -> {algo.__name__} ({len(components)} panels to cut)")
+    
+    packer = newPacker(
+        mode=PackingMode.Offline,
+        bin_algo=PackingBin.BBF,
+        pack_algo=algo,  # type: ignore
+        rotation=False,
     )
-    for comp in oversized[:5]:  # Print first 5 examples
-        print(f"   - {comp[0]}: {comp[1]} x {comp[2]}")
-else:
-    print("✅ All individual components fit within sheet dimensions.")
 
-# Estimate required sheets based on total area + a 30% buffer for waste
-total_component_area = sum(w * h for _, w, h in components)
-panel_area = panel_x * panel_y
-estimated_sheets_needed = int((total_component_area / panel_area) * 1.3) + 10
+    packer.add_bin(panel_x, panel_y, count=float("inf"))  # type: ignore
 
-print(f"Allocating {estimated_sheets_needed} wood sheets for optimization...")
+    for cid, article_x, article_y in components:
+        packer.add_rect(article_x, article_y, rid=cid)
 
+    start_time = timeit.default_timer()
+    packer.pack()  # type: ignore
+    executed_time = timeit.default_timer() - start_time
 
-# Initialize the packer
-# Using Guillotine mode ensures cuts go edge-to-edge (suitable for panel saws)
-packer = newPacker(
-    mode=PackingMode.Offline,
-    # Best Short Side Fit heuristic
-    pack_algo=guillotine.GuillotineBssfSas,  # type: ignore
-    rotation=True,  # Allow rotation if grain direction permits
-)
+    all_rects = packer.rect_list()
+    if not all_rects:
+        print(f"[{semaine_str}] Error: No components could be packed.")
+        return
 
-# Add large stock bins (wood sheets). Add enough sheets to fit all components.
-for i in range(estimated_sheets_needed):
-    packer.add_bin(panel_x, panel_y, bin_id=i)
+    num_used_sheets = len(packer)
+    surface_utilisee = sum(b.used_area() for b in packer)
+    total_board_area = num_used_sheets * panel_x * panel_y
+    waste_rate = (1.0 - (surface_utilisee / total_board_area)) * 100
 
-# Add components to the packer
-for cid, article_x, article_y in components:
-    packer.add_rect(article_x, article_y, rid=cid)
+    layout_data = {
+        "week": semaine_str,
+        "algorithm": {
+            "type": algo_type,
+            "name": algo.__name__,
+            "waste_rate (%)": waste_rate,
+            "execution_time (seconds)": executed_time,
+            "total_wood_sheets_used": num_used_sheets,
+        }
+    }
 
-# Execute the optimization
-start_time=timeit.default_timer()
-packer.pack()  # type: ignore
-print(f"Executing Time: {timeit.default_timer()-start_time}")
+    sheets_data = {}
+    for rect in packer.rect_list():
+        bin_id, x, y, width, height, item_id = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]), int(rect[4]), str(rect[5])
+        sheet_key = f"sheet_{bin_id}"
+        
+        if sheet_key not in sheets_data:
+            sheets_data[sheet_key] = []
 
-# ---------------------------------------------------------
-# Step 4: Analyze Results & Calculate Waste Rate (Taux de Chute)
-# ---------------------------------------------------------
-packed_rids = set(rect[5] for rect in packer.rect_list())
+        sheets_data[sheet_key].append({
+            "article": item_id,
+            "position_x": x,
+            "position_y": y,
+            "article_x": width,
+            "article_y": height,
+        })
 
-# Find which components didn't make it into the bins
-unpacked_components = [comp for comp in components if comp[0] not in packed_rids]
-
-if unpacked_components:
-    print(
-        f"⚠️ WARNING: {len(unpacked_components)} components could NOT fit on the sheets!"
-    )
-    for comp in unpacked_components:
-        print(f"   - Unpacked item: ID={comp[0]}, Width={comp[1]}, Height={comp[2]}")
-else:
-    print("✅ Success: All components were successfully packed.")
-
-all_rects = packer.rect_list()
-
-if not all_rects:
-    print(
-        "Error: No components could be packed. Check if individual parts exceed sheet dimensions."
-    )
-else:
-    # Identify unique sheets used
-    used_bins = set(rect[0] for rect in all_rects)
-    num_used_sheets = len(used_bins)
-
-    # Calculate areas
     sheet_area = panel_x * panel_y
-    total_board_area = num_used_sheets * sheet_area
+    for sheet_key, items in sheets_data.items():
+        used_area = sum(item["article_x"] * item["article_y"] for item in items)
+        sheet_waste_area = sheet_area - used_area
+        sheet_waste_rate = (sheet_waste_area / sheet_area) * 100
 
-    placed_rects_area = sum(rect[3] * rect[4] for rect in all_rects)
-
-    waste_area = total_board_area - placed_rects_area
-    waste_rate = (waste_area / total_board_area) * 100
-
-    print("\n--- Optimization Results ---")
-    print(f"Total Wood Sheets Used: {num_used_sheets}")
-    print(f"Total Component Area:   {placed_rects_area / 1e6:.2f} m²")
-    print(f"Total Stock Area:       {total_board_area / 1e6:.2f} m²")
-    print(f"Taux de Chute (Waste):  {waste_rate:.2f}%")
-
-# ---------------------------------------------------------
-# Step 5: Export Layout to JSON
-# ---------------------------------------------------------
-# Organize packed rectangles by sheet (bin_id)
-layout_data = {}
-
-for rect in packer.rect_list():
-    bin_id = int(rect[0])
-    x = int(rect[1])
-    y = int(rect[2])
-    width = int(rect[3])
-    height = int(rect[4])
-    item_id = str(rect[5])
-
-    sheet_key = f"sheet_{bin_id}"
-    if sheet_key not in layout_data:
-        layout_data[sheet_key] = []
-
-    layout_data[sheet_key].append(
-        {"article": item_id, "position_x": x, "position_y": y,"panel_x": width, "panel_y": height}
-    )
-
-# Calculate waste for each sheet
-for sheet_key, items in layout_data.items():
-    sheet_area = panel_x * panel_y
-    used_area = sum(item["panel_x"] * item["panel_y"] for item in items)
-    waste_area = sheet_area - used_area
-    waste_rate = (waste_area / sheet_area) * 100
-
-    layout_data[sheet_key].append(
-        {
+        layout_data[sheet_key] = {
             "sheet_dimensions": {"width": panel_x, "height": panel_y},
             "used_area": used_area,
-            "waste_area": waste_area,
-            "waste_rate_percent": waste_rate,
+            "waste_area": sheet_waste_area,
+            "waste_rate_percent": sheet_waste_rate,
+            "placed_items": items,
         }
-    )    
+
+    safe_week_str = semaine_str.replace("/", "-")
+    json_output_path = f"layout_{safe_week_str}_{algo_type}_{algo.__name__}.json"
+    with open(json_output_path, "w", encoding="utf-8") as f:
+        json.dump(layout_data, f, indent=4)
 
 
-# Save to a JSON file
-json_output_path = "cutting_layout.json"
-with open(json_output_path, "w", encoding="utf-8") as f:
-    json.dump(layout_data, f, indent=4)
+if __name__ == "__main__":
+    panel_x, panel_y, df_OF, df_article = load_base_data()
+    weekly_data = get_weekly_components(df_OF, df_article)
 
-print(f"Cutting layout successfully saved to {json_output_path}")
+    algorithms = {
+        "MaxRects": [
+            maxrects.MaxRectsBl,
+            maxrects.MaxRectsBssf,
+            maxrects.MaxRectsBaf,
+            maxrects.MaxRectsBlsf,
+        ],
+        "Skyline": [
+            skyline.SkylineBl,
+            skyline.SkylineBlWm,
+            skyline.SkylineMwf,
+            skyline.SkylineMwfl,
+            skyline.SkylineMwfWm,
+            skyline.SkylineMwflWm,
+        ],
+        "Guillotine": [
+            guillotine.GuillotineBssfSas,
+            guillotine.GuillotineBssfLas,
+            guillotine.GuillotineBssfSlas,
+            guillotine.GuillotineBssfLlas,
+            guillotine.GuillotineBssfMaxas,
+            guillotine.GuillotineBssfMinas,
+            guillotine.GuillotineBlsfSas,
+            guillotine.GuillotineBlsfLas,
+            guillotine.GuillotineBlsfSlas,
+            guillotine.GuillotineBlsfLlas,
+            guillotine.GuillotineBlsfMaxas,
+            guillotine.GuillotineBlsfMinas,
+            guillotine.GuillotineBafSas,
+            guillotine.GuillotineBafLas,
+            guillotine.GuillotineBafSlas,
+            guillotine.GuillotineBafLlas,
+            guillotine.GuillotineBafMaxas,
+            guillotine.GuillotineBafMinas,
+        ],
+    }
 
+    for algo_type, algo_list in algorithms.items():
+        for algo in algo_list:
+            run_optimization_for_week(
+                "2026/S17", weekly_data["2026/S17"]["components"], algo_type, algo, panel_x, panel_y
+            )
+    """
+    # Loop through each week and each algorithm
+    for semaine, data in weekly_data.items():
+        print(f"\n--- Processing Week starting: {semaine} (Total Ordered Qty: {data['total_command']}) ---")
+        
+        for algo_type, algo_list in algorithms.items():
+            for algo in algo_list:
+                run_optimization_for_week(
+                    semaine, data["components"], algo_type, algo, panel_x, panel_y
+                )
+    """
