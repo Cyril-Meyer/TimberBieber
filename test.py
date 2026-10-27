@@ -97,7 +97,7 @@ def run_optimization_for_week(semaine_str, components, algo_type, algo, panel_x,
         mode=PackingMode.Offline,
         bin_algo=PackingBin.BBF,
         pack_algo=algo,  # type: ignore
-        rotation=False,
+        rotation=True,
     )
 
     packer.add_bin(panel_x, panel_y, count=float("inf"))  # type: ignore

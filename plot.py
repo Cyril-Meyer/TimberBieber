@@ -4,28 +4,26 @@ import matplotlib.pyplot as plt
 
 Algorithms_Types = ["Guillotine", "MaxRects", "Skyline"]
 
-def plot_cutting_analysis(algo_index=1, file_pattern=None):
+def plot_cutting_analysis(algo_index=0, file_pattern=None):
     """
-    Extracts data from cutting layout JSON files and plots execution time and waste rate with debug info.
+    Extracts data from cutting layout JSON files, sorts them from best to worst 
+    (lowest waste rate to highest), and plots execution time and waste rate.
     """
-    # 1. Find all generated JSON files matching the naming pattern
     if file_pattern is None:
         current_algo_type = Algorithms_Types[algo_index]
-        # NOTE: If you are using the weekly script, files are named "layout_...json" 
-        # instead of "cutting_layout_...json". Change this if needed!
         file_pattern = f"layout_*_{current_algo_type}_*.json" 
 
     json_files = glob.glob(file_pattern)
+    print(f"DEBUG: Found {len(json_files)} files matching pattern: {file_pattern}")
 
     if not json_files:
-        print("No layout JSON files found.")
+        print("No cutting layout JSON files found.")
         return
 
     algorithms = []
     execution_times = []
     waste_rates = []
 
-    # 2. Extract data from each file
     for file_path in json_files:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -33,16 +31,29 @@ def plot_cutting_analysis(algo_index=1, file_pattern=None):
         # Read metadata stored in the "algorithm" key
         algo_info = data.get("algorithm", {})
         algo_name = algo_info.get("name", file_path)
-        exec_time = algo_info.get("execution_time (seconds)", 0)
-        waste = algo_info.get("waste_rate (%)", 0)
+        exec_time = float(algo_info.get("execution_time (seconds)", 0))
+        waste = float(algo_info.get("waste_rate (%)", 0))
         
         algorithms.append(algo_name)
         execution_times.append(exec_time)
         waste_rates.append(waste)
 
+    if not execution_times or all(v == 0 for v in execution_times):
+        print("WARNING: All execution times are 0 or lists are empty! Check your JSON structure.")
+        return
+
+    
+    combined = list(zip(algorithms, execution_times, waste_rates))
+    combined.sort(key=lambda x: x[2])  # Sorts ascending by waste_rates
+    
+    if combined:
+        algorithms, execution_times, waste_rates = zip(*combined)
+        algorithms = list(algorithms)
+        execution_times = list(execution_times)
+        waste_rates = list(waste_rates)
+
     # 3. Create the Matplotlib plots
     plt.figure(figsize=(12, 5))
-
     current_algo_type = Algorithms_Types[algo_index]
 
     # Chart 1: Execution Time
@@ -71,5 +82,4 @@ def plot_cutting_analysis(algo_index=1, file_pattern=None):
     plt.show()
 
 if __name__ == "__main__":
-    # Test it (adjust file_pattern if your files start with 'layout_' instead of 'cutting_layout_')
-    plot_cutting_analysis(algo_index=1, file_pattern="layout_*_MaxRects_*.json")
+    plot_cutting_analysis(algo_index=1)
