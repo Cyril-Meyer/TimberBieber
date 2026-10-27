@@ -4,6 +4,7 @@ import timeit
 import pandas as pd
 import rectpack
 import rectpack.guillotine as guillotine
+import rectpack.skyline as skyline
 from rectpack import PackingMode, newPacker
 
 # ---------------------------------------------------------
@@ -158,8 +159,25 @@ for rect in packer.rect_list():
         layout_data[sheet_key] = []
 
     layout_data[sheet_key].append(
-        {"id": item_id, "x": x, "y": y, "width": width, "height": height}
+        {"article": item_id, "position_x": x, "position_y": y,"panel_x": width, "panel_y": height}
     )
+
+# Calculate waste for each sheet
+for sheet_key, items in layout_data.items():
+    sheet_area = panel_x * panel_y
+    used_area = sum(item["panel_x"] * item["panel_y"] for item in items)
+    waste_area = sheet_area - used_area
+    waste_rate = (waste_area / sheet_area) * 100
+
+    layout_data[sheet_key].append(
+        {
+            "sheet_dimensions": {"width": panel_x, "height": panel_y},
+            "used_area": used_area,
+            "waste_area": waste_area,
+            "waste_rate_percent": waste_rate,
+        }
+    )    
+
 
 # Save to a JSON file
 json_output_path = "cutting_layout.json"
@@ -167,3 +185,4 @@ with open(json_output_path, "w", encoding="utf-8") as f:
     json.dump(layout_data, f, indent=4)
 
 print(f"Cutting layout successfully saved to {json_output_path}")
+
