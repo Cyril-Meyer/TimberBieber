@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Confidential / sensitive data
+*.xlsx
+*.csv
+*.json
+
+# MacOS
+.DS_Store
+
 # C extensions
 *.so
 
