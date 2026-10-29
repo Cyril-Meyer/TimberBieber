@@ -24,7 +24,7 @@ IAporject/
 │   ├── sequencing.py   ordre de coupe, liste des OF, stock tampon
 │   ├── comparaison.py  graphiques au format Schmidt « TdC par Coloris »
 │   └── main.py         paramètres et écriture du fichier Excel
-├── data/               ← y déposer les 3 fichiers Excel de Schmidt (non versionnés)
+├── data/               les 3 fichiers Excel de Schmidt 
 └── results/            créé à l'exécution
 ```
 
